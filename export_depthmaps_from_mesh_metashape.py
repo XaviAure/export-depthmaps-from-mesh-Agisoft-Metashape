@@ -36,9 +36,10 @@ PERCENTILE_HIGH = 100.0
 # Reserve 65535 strictly as NoData/background.
 MAX_VALID_DEPTH_VALUE = 65534
 
-# Edge protection: don't inpaint this many pixels from the edge
-# Only used when inpainting is enabled - set to 0 when skipping inpainting
-EDGE_PROTECTION_PIXELS = 5
+# Edge protection: don't inpaint this many pixels from the edge.
+# Keep at 0 so exported maps match the original image dimensions exactly
+# (any nonzero value erodes the mask and produces a NoData border).
+EDGE_PROTECTION_PIXELS = 0
 
 # Set to False for quality exports (fills interior holes), True for fast preview exports.
 SKIP_INPAINTING = False
