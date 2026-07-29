@@ -17,7 +17,7 @@ import os
 import time
 import tempfile
 import json
-from scipy.ndimage import generic_filter, binary_erosion
+from scipy.ndimage import binary_erosion, binary_fill_holes, convolve, gaussian_filter
 from scipy.interpolate import griddata
 
 # ============================================================================
@@ -73,6 +73,8 @@ doc = Metashape.app.document
 if not doc.chunk:
     raise RuntimeError("No active chunk found.")
 chunk = doc.chunk
+if chunk.model is None:
+    raise RuntimeError("No mesh (model) found in the active chunk. Generate a mesh first.")
 print("✓ Active chunk loaded")
 
 # Extract the project's scale factor to convert depth values to real-world units
@@ -122,13 +124,25 @@ def create_object_mask(depth_channel, edge_erosion=EDGE_PROTECTION_PIXELS):
 
     Returns:
         Mask image (True = object, False = background)
+
+    Note:
+        Interior gaps (pixels with no rendered depth that are fully enclosed
+        by valid geometry) are included in the object mask via
+        binary_fill_holes, so the inpainting stage can find and fill them.
+        Without this, hole pixels would be classified as background and the
+        inpainting would never run.
     """
-    # Valid object pixels are those with depth > 0
-    object_mask = depth_channel > 0
-    
+    # Valid rendered pixels are those with depth > 0; close enclosed gaps so
+    # they count as object (they will be inpainted later).
+    rendered_mask = depth_channel > 0
+    object_mask = binary_fill_holes(rendered_mask)
+
+    interior_gap_count = np.sum(object_mask & ~rendered_mask)
+    if interior_gap_count > 0:
+        print(f"  Object mask includes {interior_gap_count} interior gap pixels (will be inpainted)")
+
     # Erode the mask to protect edges
     if edge_erosion > 0:
-        from scipy.ndimage import binary_erosion
         structure = np.ones((edge_erosion * 2 + 1, edge_erosion * 2 + 1))
         object_mask = binary_erosion(object_mask, structure=structure)
         print(f"  Object mask eroded by {edge_erosion} pixels to protect edges")
@@ -233,8 +247,9 @@ def advanced_inpainting_with_mask(depth_map, object_mask, fill_value=FILL_VALUE,
     
     # Stage 2: Edge-preserving smoothing (only within mask)
     print("    Stage 2/3: Edge-preserving smoothing")
-    filled_map = iterative_edge_preserving_fill_masked(filled_map, holes_in_object, 
-                                                        object_mask, max_iterations)
+    filled_map = iterative_edge_preserving_fill_masked(filled_map, holes_in_object,
+                                                        object_mask, max_iterations,
+                                                        fill_value=fill_value)
     
     # Stage 3: Morphological refinement (only within mask)
     print("    Stage 3/3: Morphological refinement")
@@ -282,54 +297,49 @@ def distance_weighted_interpolation_masked(depth_map, object_mask, fill_value):
     return depth_map
 
 
-def iterative_edge_preserving_fill_masked(depth_map, original_holes, object_mask, max_iterations):
-    """Repeatedly fills remaining gaps using nearby values, staying within the object area."""
-    filled_map = depth_map.copy()
-    current_holes = original_holes.copy()
-    
+def iterative_edge_preserving_fill_masked(depth_map, original_holes, object_mask,
+                                          max_iterations, fill_value=FILL_VALUE):
+    """
+    Repeatedly fills remaining gaps from valid 5x5 neighbours, staying within
+    the object area.
+
+    Implementation note: this uses convolution-based neighbourhood averaging
+    (sum of valid neighbours / count of valid neighbours) instead of
+    scipy.ndimage.generic_filter, because generic_filter does not tell the
+    kernel function *where* in the image it is, so per-pixel hole checks are
+    impossible inside it.
+    """
+    filled_map = depth_map.astype(np.float32).copy()
+    # Holes still marked with fill_value (Stage 1 normally fills everything,
+    # so this is a safety net for pixels griddata could not reach).
+    holes = original_holes & (filled_map == fill_value)
+    kernel = np.ones((5, 5), dtype=np.float32)
+
     for iteration in range(max_iterations):
-        if not np.any(current_holes):
+        if not np.any(holes):
             break
-        
-        remaining = np.sum(current_holes)
+
+        remaining = np.sum(holes)
         print(f"      Iteration {iteration + 1}/{max_iterations}: {remaining} holes remaining")
-        
-        def adaptive_mean_filter(values):
-            center_idx = len(values) // 2
-            center_val = values[center_idx]
-            
-            # Only fill if this pixel is a hole AND in the object mask
-            if not current_holes.flat[center_idx]:
-                return center_val
-            
-            # Only use neighbors that are also within object mask
-            valid_neighbors = values[values > 0]
-            if len(valid_neighbors) == 0:
-                return center_val
-            
-            weights = np.exp(-0.1 * np.abs(valid_neighbors - np.median(valid_neighbors)))
-            weighted_mean = np.average(valid_neighbors, weights=weights)
-            
-            return weighted_mean
-        
-        filled_map = generic_filter(filled_map, adaptive_mean_filter, size=5, mode='reflect')
-        
-        # Update holes - only within object mask
-        new_holes = original_holes & (filled_map <= 0) & object_mask
-        
-        if np.array_equal(current_holes, new_holes):
-            print(f"      Converged after {iteration + 1} iterations")
+
+        # Valid donor pixels: inside the object, not holes, not fill_value
+        valid = object_mask & ~holes & (filled_map != fill_value)
+        neighbour_sums = convolve(np.where(valid, filled_map, 0.0), kernel, mode='reflect')
+        neighbour_counts = convolve(valid.astype(np.float32), kernel, mode='reflect')
+
+        can_fill = holes & (neighbour_counts > 0)
+        if not np.any(can_fill):
+            print("      No remaining holes have valid neighbours; stopping")
             break
-        
-        current_holes = new_holes
-    
+
+        filled_map[can_fill] = neighbour_sums[can_fill] / neighbour_counts[can_fill]
+        holes = holes & ~can_fill
+
     return filled_map
 
 
 def morphological_refinement_masked(depth_map, original_holes, object_mask):
     """Gently smooth the filled areas so they blend with surrounding pixels."""
-    from scipy.ndimage import gaussian_filter
-    
     filled_regions = original_holes & object_mask
     
     if not np.any(filled_regions):
@@ -426,7 +436,7 @@ if not np.isfinite(depth_range) or depth_range <= 1e-12:
 
 print(f"\n{'=' * 80}")
 print(f"GLOBAL DEPTH RANGE: {global_min_depth:.3f}m to {global_max_depth:.3f}m")
-print(f"Range: {depth_range:.3f}m | Precision: {depth_range/65535:.4f}m per value")
+print(f"Range: {depth_range:.3f}m | Precision: {depth_range/MAX_VALID_DEPTH_VALUE:.4f}m per value")
 print(f"{'=' * 80}")
 
 # Calculate real-world image dimensions from camera parameters
@@ -534,6 +544,10 @@ for i, camera in enumerate(valid_cameras):
         depth_inverted = MAX_VALID_DEPTH_VALUE - depth_scaled
         # Set background (outside object mask) to white (65535) after inversion
         depth_inverted[~object_mask] = FILL_VALUE
+        # Mark interior gaps (inside the object mask but with no rendered
+        # depth) as FILL_VALUE so the inpainting stage can find them.
+        interior_holes = object_mask & (depth_channel <= 0)
+        depth_inverted[interior_holes] = FILL_VALUE
         print("  ✓ Inverted depth values")
 
         # Inpaint only within object mask (or skip if disabled for speed)
@@ -549,21 +563,22 @@ for i, camera in enumerate(valid_cameras):
         # Export depth map
         output_filename = f"{camera_label}_depth.tif"
         output_file = os.path.join(output_folder, output_filename)
-        imageio.imwrite(output_file, depth_filled, format='tiff')
+        imageio.imwrite(output_file, depth_filled)
         print(f"  ✓ Saved depth: {output_filename}")
         
         # Export object mask as 8-bit (0=background, 255=object)
         mask_filename = f"{camera_label}_mask.tif"
         mask_file = os.path.join(output_folder, mask_filename)
         mask_8bit = (object_mask * 255).astype(np.uint8)
-        imageio.imwrite(mask_file, mask_8bit, format='tiff')
+        imageio.imwrite(mask_file, mask_8bit)
         print(f"  ✓ Saved mask: {mask_filename}")
         
         # Save statistics with height measurements
         valid_pixels = np.sum(object_mask)
         filled_pixels = np.sum((depth_inverted == FILL_VALUE) & object_mask)
         
-        valid_depths = depth_channel[object_mask]
+        # Exclude interior gap pixels (depth 0) so the minimum is a real depth
+        valid_depths = depth_channel[object_mask & (depth_channel > 0)]
         camera_min_depth = float(np.min(valid_depths)) if len(valid_depths) > 0 else 0.0
         camera_max_depth = float(np.max(valid_depths)) if len(valid_depths) > 0 else 0.0
         metric_stats = estimate_camera_metric_stats(
